@@ -1,7 +1,23 @@
-venv/
-*.pyc
+# --- 1. Python & System Junk ---
 __pycache__/
+*.py[cod]
 .DS_Store
+
+# --- 2. Virtual Environment (Crucial) ---
+venv/
+.env
+
+# --- 3. The Heavy Data (DO NOT COMMIT) ---
 data/
-photo_library.db
+input_photos/
+sorted_photos/
 review_collages/
+
+# --- 4. The Database & Caches ---
+*.db
+*.pkl
+*.log
+
+# --- 5. Exceptions (Optional) ---
+# If you want to keep the log file in the archive specifically, you can force it:
+# !archive/rejected_files_log.txt

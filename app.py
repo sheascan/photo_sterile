@@ -1,133 +1,297 @@
 import streamlit as st
 import os
 import shutil
+import sqlite3
+import cv2
+import imagehash
+import concurrent.futures
+import warnings
+from datetime import datetime
 from PIL import Image
-from send2trash import send2trash
+
+# --- 1. SILENCE THE NOISE ---
+warnings.filterwarnings("ignore")
+os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 
 # --- CONFIGURATION ---
-CLUSTER_DIR = "clusters"      # Where your grouped duplicate folders are
-OUTPUT_DIR = "final_album"    # Where the "winners" go
-# ---------------------
+DB_FILE = "photo_library.db"
+OUTPUT_FOLDER = "sorted_photos"
 
-# Ensure output directory exists
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+st.set_page_config(page_title="Photo Detective v10.3", layout="wide")
+st.title("📚 Photo Detective v10.3: Incremental Save")
 
-st.set_page_config(layout="wide", page_title="High-Perf Photo Curator")
+# --- DATABASE ---
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS images
+                 (id INTEGER PRIMARY KEY,
+                  path TEXT UNIQUE,
+                  phash TEXT,
+                  timestamp INTEGER,
+                  sharpness INTEGER,
+                  width INTEGER,
+                  height INTEGER,
+                  status TEXT DEFAULT 'NEW')''') 
+    c.execute('''CREATE TABLE IF NOT EXISTS clusters
+                 (cluster_id INTEGER,
+                  image_id INTEGER,
+                  is_winner BOOLEAN)''')
+    conn.commit()
+    conn.close()
 
-# --- HELPER FUNCTIONS ---
+def get_db_count():
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT count(*) FROM images")
+        count = c.fetchone()[0]
+        conn.close()
+        return count
+    except: return 0
 
-def get_clusters():
-    """Scans the directory for subfolders (clusters)."""
-    if not os.path.exists(CLUSTER_DIR):
-        return []
-    # Get all subdirectories that contain images
-    clusters = [f.path for f in os.scandir(CLUSTER_DIR) if f.is_dir()]
-    # Sort them so order is consistent
-    return sorted(clusters)
+# --- ANALYSIS ---
+def get_timestamp(img_path):
+    try:
+        with Image.open(img_path) as img:
+            exif = img.getexif()
+            if not exif: return 0
+            date_str = exif.get(36867) or exif.get(306)
+            if date_str:
+                dt = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
+                return int(dt.timestamp())
+    except: return 0
+    return 0
 
-def load_images_in_cluster(cluster_path):
-    """Loads image paths from a specific cluster folder."""
-    valid_exts = ('.jpg', '.jpeg', '.png', '.webp')
-    files = [
-        os.path.join(cluster_path, f) 
-        for f in os.listdir(cluster_path) 
-        if f.lower().endswith(valid_exts)
-    ]
-    return sorted(files)
+def analyze_image(path):
+    try:
+        pil_img = Image.open(path)
+        h = str(imagehash.phash(pil_img)) 
+        cv_img = cv2.imread(path)
+        if cv_img is None: return None
+        gray = cv2.cvtColor(cv_img, cv2.COLOR_BGR2GRAY)
+        sharp = int(cv2.Laplacian(gray, cv2.CV_64F).var())
+        height, width, _ = cv_img.shape
+        ts = get_timestamp(path)
+        return (path, h, ts, sharp, width, height)
+    except:
+        return None
 
-def finalize_cluster(keeper_path, cluster_path, all_images):
-    """Moves the winner to Final Album, trashes the rest, removes empty cluster folder."""
+# --- UI ---
+init_db()
+
+with st.sidebar:
+    st.header("Library Stats")
+    # We use an empty placeholder so we can update this number LIVE during scan
+    stats_placeholder = st.empty()
+    stats_placeholder.metric("Indexed Images", get_db_count())
     
-    # 1. Move the Keeper
-    file_name = os.path.basename(keeper_path)
-    dest_path = os.path.join(OUTPUT_DIR, file_name)
+    st.divider()
+    st.header("1. Ingest")
+    scan_path = st.text_input("Folder to Scan", "./data/input_photos")
+    workers = st.slider("Threads", 1, 16, 4)
     
-    # Handle name collisions in destination
-    if os.path.exists(dest_path):
-        base, ext = os.path.splitext(file_name)
-        dest_path = os.path.join(OUTPUT_DIR, f"{base}_copy{ext}")
-        
-    shutil.move(keeper_path, dest_path)
-    
-    # 2. Trash the Rejects (everything else in the list)
-    for img in all_images:
-        if img != keeper_path and os.path.exists(img):
-            send2trash(img) # Safely send to Recycle Bin
-            
-    # 3. Remove the now empty cluster folder
-    if os.path.exists(cluster_path):
-        # Check if empty before removing to be safe
-        if not os.listdir(cluster_path):
-            os.rmdir(cluster_path)
+    if st.button("Scan & Add to Library", type="primary"):
+        if not os.path.exists(scan_path):
+            st.error("Folder not found!")
         else:
-            # If random non-image files remain, send folder to trash
-            send2trash(cluster_path)
+            valid_exts = ('.jpg', '.jpeg', '.png', '.webp', '.heic')
+            files_to_process = []
+            
+            st.write("Checking DB...")
+            existing_paths = set()
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("SELECT path FROM images")
+            for row in c.fetchall(): existing_paths.add(row[0])
+            conn.close()
 
-# --- APP LOGIC ---
+            st.write("Crawling...")
+            for root, _, files in os.walk(scan_path):
+                for f in files:
+                    if f.lower().endswith(valid_exts):
+                        full_path = os.path.join(root, f)
+                        if full_path not in existing_paths:
+                            files_to_process.append(full_path)
+            
+            if not files_to_process:
+                st.warning("No new images found.")
+            else:
+                st.info(f"Found {len(files_to_process)} new images.")
+                prog = st.progress(0)
+                status = st.empty()
+                
+                # --- NEW LOGIC: INCREMENTAL SAVING ---
+                chunk_buffer = []
+                total_processed = 0
+                
+                with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                    future_to_file = {executor.submit(analyze_image, f): f for f in files_to_process}
+                    
+                    for i, future in enumerate(concurrent.futures.as_completed(future_to_file)):
+                        res = future.result()
+                        if res: 
+                            chunk_buffer.append(res)
+                            total_processed += 1
+                        
+                        # SAVE EVERY 50 IMAGES
+                        if len(chunk_buffer) >= 50:
+                            conn = sqlite3.connect(DB_FILE)
+                            c = conn.cursor()
+                            c.executemany("INSERT OR IGNORE INTO images (path, phash, timestamp, sharpness, width, height) VALUES (?,?,?,?,?,?)", chunk_buffer)
+                            conn.commit()
+                            conn.close()
+                            
+                            # Clear buffer
+                            chunk_buffer = []
+                            
+                            # Update Side Stats Live
+                            current_db_count = get_db_count()
+                            stats_placeholder.metric("Indexed Images", current_db_count)
 
-st.title("📸 High-Perf Curator")
+                        # Update Progress Bar
+                        if i % 20 == 0: 
+                            prog.progress((i + 1) / len(files_to_process))
+                            status.write(f"Analyzing {i+1}/{len(files_to_process)} (Saved {total_processed})")
+                            
+                # Save any remaining in buffer
+                if chunk_buffer:
+                    conn = sqlite3.connect(DB_FILE)
+                    c = conn.cursor()
+                    c.executemany("INSERT OR IGNORE INTO images (path, phash, timestamp, sharpness, width, height) VALUES (?,?,?,?,?,?)", chunk_buffer)
+                    conn.commit()
+                    conn.close()
 
-# Initialize Session State to track progress
-if 'cluster_index' not in st.session_state:
-    st.session_state.cluster_index = 0
+                prog.progress(1.0)
+                st.success(f"Finished! Added {total_processed} images.")
+                # Final Stats Update
+                stats_placeholder.metric("Indexed Images", get_db_count())
+                st.rerun()
 
-# Load directory structure
-all_clusters = get_clusters()
-
-if not all_clusters:
-    st.success(f"🎉 No clusters found in '{CLUSTER_DIR}'. You are done!")
-    st.stop()
-
-# Check if we are out of bounds (finished)
-if st.session_state.cluster_index >= len(all_clusters):
-    st.balloons()
-    st.success("All clusters reviewed!")
-    if st.button("Restart Review"):
-        st.session_state.cluster_index = 0
-        st.rerun()
-    st.stop()
-
-# Get current cluster
-current_cluster_path = all_clusters[st.session_state.cluster_index]
-current_images = load_images_in_cluster(current_cluster_path)
-
-# If a folder is empty or invalid, skip it automatically
-if not current_images:
-    st.session_state.cluster_index += 1
-    st.rerun()
-
-# --- UI LAYOUT ---
-
-st.write(f"**Reviewing Cluster {st.session_state.cluster_index + 1} of {len(all_clusters)}**")
-st.caption(f"Location: `{current_cluster_path}`")
-
-# Create a grid of columns equal to the number of images (max 4 per row ideally, but flexible)
-cols = st.columns(len(current_images))
-
-for idx, col in enumerate(cols):
-    img_path = current_images[idx]
-    img_name = os.path.basename(img_path)
+    st.divider()
+    st.header("2. Detect")
+    sim_thresh = st.slider("Hash Distance", 0, 30, 16)
+    time_rad = st.slider("Time Radius (Days)", 1, 30, 10)
     
-    with col:
-        # Display Image
-        try:
-            image = Image.open(img_path)
-            # Resize for display performance (thumbnails)
-            image.thumbnail((400, 400)) 
-            st.image(image, use_container_width=True)
-        except Exception as e:
-            st.error(f"Error loading {img_name}")
+    if st.button("Find Global Duplicates"):
+        st.write("Loading Index...")
+        conn = sqlite3.connect(DB_FILE)
+        rows = conn.execute("SELECT * FROM images").fetchall()
+        conn.close()
+        
+        if not rows: st.stop()
 
-        # The "Keep This One" Button
-        if st.button(f"🏆 Keep\n{img_name}", key=img_path):
-            finalize_cluster(img_path, current_cluster_path, current_images)
-            # Move to next cluster automatically (creating a new list on rerun)
-            # Note: We don't increment index because the current folder is now gone,
-            # so the next folder in the list effectively slides into this index.
+        data_objs = []
+        for r in rows:
+            try:
+                data_objs.append({
+                    'id': r[0], 'path': r[1],
+                    'hash': imagehash.hex_to_hash(r[2]),
+                    'ts': r[3],
+                    'score': r[4] + (r[5]*r[6]/10000)
+                })
+            except: pass
+            
+        data_objs.sort(key=lambda x: x['ts'])
+        clusters = []
+        visited = set()
+        prog = st.progress(0)
+        status = st.empty()
+        total = len(data_objs)
+        
+        for i in range(total):
+            if data_objs[i]['id'] in visited: continue
+            img_a = data_objs[i]
+            current_cluster = [img_a]
+            visited.add(img_a['id'])
+            
+            for j in range(i + 1, total):
+                img_b = data_objs[j]
+                if img_b['id'] in visited: continue
+                
+                if img_a['ts'] > 0 and img_b['ts'] > 0:
+                    if abs(img_a['ts'] - img_b['ts']) / 86400 > time_rad: break 
+                
+                if (img_a['hash'] - img_b['hash']) <= sim_thresh:
+                    current_cluster.append(img_b)
+                    visited.add(img_b['id'])
+
+            if len(current_cluster) > 1: clusters.append(current_cluster)
+            if i % 200 == 0: 
+                prog.progress((i+1)/total)
+                status.write(f"Comparing {i}/{total}")
+
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("DELETE FROM clusters")
+        for c_idx, clust in enumerate(clusters):
+            winner = max(clust, key=lambda x: x['score'])
+            for item in clust:
+                c.execute("INSERT INTO clusters VALUES (?,?,?)", (c_idx, item['id'], (item==winner)))
+        conn.commit()
+        conn.close()
+        st.success(f"Found {len(clusters)} clusters!")
+
+# --- REVIEW TAB ---
+t1, t2 = st.tabs(["Review", "Tools"])
+with t1:
+    conn = sqlite3.connect(DB_FILE)
+    try: c_ids = [x[0] for x in conn.execute("SELECT DISTINCT cluster_id FROM clusters").fetchall()]
+    except: c_ids = []
+    conn.close()
+    
+    if c_ids:
+        if 'page' not in st.session_state: st.session_state.page = 0
+        ITEMS_PER_PAGE = 10
+        total_pages = (len(c_ids) - 1) // ITEMS_PER_PAGE + 1
+        
+        c1, c2, c3 = st.columns([1,2,1])
+        with c1: 
+            if st.button("⬅️ Prev") and st.session_state.page > 0: 
+                st.session_state.page -= 1
+                st.rerun()
+        with c2: st.markdown(f"**Page {st.session_state.page + 1} / {total_pages}**")
+        with c3:
+            if st.button("Next ➡️") and st.session_state.page < total_pages - 1:
+                st.session_state.page += 1
+                st.rerun()
+                
+        start = st.session_state.page * ITEMS_PER_PAGE
+        current_ids = c_ids[start:start+ITEMS_PER_PAGE]
+        
+        conn = sqlite3.connect(DB_FILE)
+        for cid in current_ids:
+            st.divider()
+            st.subheader(f"Cluster #{cid}")
+            items = conn.execute("SELECT images.path, clusters.is_winner, images.sharpness, images.width, images.height FROM clusters JOIN images ON clusters.image_id = images.id WHERE clusters.cluster_id = ?", (cid,)).fetchall()
+            cols = st.columns(len(items))
+            for idx, item in enumerate(items):
+                path, is_win, sharp, w, h = item
+                with cols[idx]:
+                    try:
+                        img = Image.open(path)
+                        img.thumbnail((300,300))
+                        st.image(img, caption=os.path.basename(path))
+                        if is_win: st.success(f"🏆 Best ({sharp})")
+                        else: st.error(f"Duplicate ({sharp})")
+                        if st.button("Keep This Only", key=f"k_{path}_{cid}"):
+                            k_dir = os.path.join(OUTPUT_FOLDER, "Keepers")
+                            d_dir = os.path.join(OUTPUT_FOLDER, "Discards")
+                            os.makedirs(k_dir, exist_ok=True)
+                            os.makedirs(d_dir, exist_ok=True)
+                            shutil.move(path, os.path.join(k_dir, os.path.basename(path)))
+                            for sub in items:
+                                if sub[0] != path and os.path.exists(sub[0]):
+                                    shutil.move(sub[0], os.path.join(d_dir, os.path.basename(sub[0])))
+                            st.rerun()
+                    except: st.error("Missing")
+        conn.close()
+    else:
+        st.info("No duplicates found yet.")
+
+with t2:
+    if st.button("⚠️ Wipe Database"):
+        if os.path.exists(DB_FILE):
+            os.remove(DB_FILE)
+            st.success("Deleted.")
             st.rerun()
-
-# Option to skip cluster (keep all for later)
-st.divider()
-if st.button("⏭️ Skip this Cluster (Keep All)"):
-    st.session_state.cluster_index += 1
-    st.rerun()

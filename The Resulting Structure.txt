@@ -1,0 +1,16 @@
+The Resulting Structure
+app.py (Run this to index)
+
+investigator.py (Run this to view)
+
+sniper.py (Run this to clean)
+
+converter.py (Run this for HEIC)
+
+utilities/ (Contains your 3 forensic tools)
+
+archive/ (Contains the history)
+
+data/, sorted_photos/, photo_library.db (Your data)
+
+This is the professional way to organize the project.
