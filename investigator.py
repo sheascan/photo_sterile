@@ -146,7 +146,20 @@ with st.sidebar:
     if st.button("Go"):
         st.session_state.page = target_page - 1
         st.rerun()
-
+# --- EXIT BUTTON (POLITE VERSION) ---
+    st.markdown("---")
+    if st.button("❌ Exit App"):
+        st.markdown("### 👋 Goodbye!")
+        st.success("Server shutting down... You can close this tab.")
+        
+        # Wait 2 seconds to let the message render, THEN kill the server
+        import time
+        time.sleep(2)
+        
+        import os
+        import signal
+        os.kill(os.getpid(), signal.SIGTERM)
+        
 # 2. MAIN VIEW
 t1, t2 = st.tabs(["🎞️ Filmstrip Review", "⚙️ Tools"])
 

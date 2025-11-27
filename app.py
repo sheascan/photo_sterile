@@ -231,7 +231,20 @@ with st.sidebar:
         conn.commit()
         conn.close()
         st.success(f"Found {len(clusters)} clusters!")
-
+# --- EXIT BUTTON (POLITE VERSION) ---
+    st.markdown("---")
+    if st.button("❌ Exit App"):
+        st.markdown("### 👋 Goodbye!")
+        st.success("Server shutting down... You can close this tab.")
+        
+        # Wait 2 seconds to let the message render, THEN kill the server
+        import time
+        time.sleep(2)
+        
+        import os
+        import signal
+        os.kill(os.getpid(), signal.SIGTERM)
+        
 # --- REVIEW TAB ---
 t1, t2 = st.tabs(["Review", "Tools"])
 with t1:
